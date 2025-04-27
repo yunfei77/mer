@@ -1993,9 +1993,34 @@ def check_domain_registration_with_retry(domain: str, max_retries: int = 3) -> D
             print(f"第 {attempt + 1} 次尝试失败，准备重试...")
             time.sleep(2)  # 等待2秒后重试
 
+def get_verified_path(path_type="any"):
+    """获取已验证的指定类型路径"""
+    while True:
+        try:
+            raw_input = input("路径输入（支持拖拽文件）: ").strip(' "\'')
+            full_path = os.path.normpath(os.path.expanduser(raw_input))
+            
+            if not os.path.exists(full_path):
+                raise FileNotFoundError("路径不存在")
+                
+            if path_type == "file" and not os.path.isfile(full_path):
+                raise ValueError("必须选择文件")
+                
+            if path_type == "dir" and not os.path.isdir(full_path):
+                raise ValueError("必须选择目录")
+                
+            return full_path
+            
+        except (FileNotFoundError, ValueError) as e:
+            print(f"输入错误: {str(e)}")
+        except Exception as e:
+            print(f"未知错误: {str(e)}")
+
+
 # 使用示例
 if __name__ == "__main__":
-    test_file = r"C:\Users\v_ayfzhang\Documents\email\1744289278678.eml"
+    # test_file = r"/Users/admin/Downloads/1745443910003.eml"
+    test_file = get_verified_path("file")
 
     try:
         print(f"开始解析邮件: {test_file}")
