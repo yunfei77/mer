@@ -2185,49 +2185,118 @@ def check_domain_registration_with_retry(domain: str, max_retries: int = 3) -> D
             print(f"第 {attempt + 1} 次尝试失败，准备重试...")
             time.sleep(2)  # 等待2秒后重试
 
-def get_verified_path(path_type="any"):
-    """获取已验证的指定类型路径"""
-    while True:
-        try:
-            raw_input = input("路径输入（支持拖拽文件）: ").strip(' "\'')
-            full_path = os.path.normpath(os.path.expanduser(raw_input))
-            
-            if not os.path.exists(full_path):
-                raise FileNotFoundError("路径不存在")
-                
-            if path_type == "file" and not os.path.isfile(full_path):
-                raise ValueError("必须选择文件")
-                
-            if path_type == "dir" and not os.path.isdir(full_path):
-                raise ValueError("必须选择目录")
-                
-            return full_path
-            
-        except (FileNotFoundError, ValueError) as e:
-            print(f"输入错误: {str(e)}")
-        except Exception as e:
-            print(f"未知错误: {str(e)}")
+def print_banner():
+    """启动欢迎界面"""
+    B  = '\033[1;34m'
+    W  = '\033[1;37m'
+    C  = '\033[1;36m'
+    G  = '\033[1;32m'
+    Y  = '\033[1;33m'
+    RS = '\033[0m'
+
+    print(f"\n{B}{'═'*62}{RS}")
+    print(f"{W}{'':^62}{RS}")
+    print(f"{W}{'📧  恶意邮件智能鉴定工具':^56}{RS}")
+    print(f"{C}{'Malicious Email Recognition  v1.0':^62}{RS}")
+    print(f"{W}{'':^62}{RS}")
+    print(f"{B}{'═'*62}{RS}")
+    print(f"""
+  {W}支持格式{RS}  .eml（标准邮件）/ .msg（Outlook 邮件）
+
+  {W}检测能力{RS}
+  {G}✔{RS} SPF / DKIM / DMARC 邮件认证
+  {G}✔{RS} 发件人伪造 & Reply-To 劫持检测
+  {G}✔{RS} 域名仿冒（字符替换 / 编辑距离 / 同形字攻击）
+  {G}✔{RS} 域名注册年龄 WHOIS 分析
+  {G}✔{RS} 恶意附件（可执行文件 / 宏文档 / 双扩展名）
+  {G}✔{RS} 隐藏跟踪像素 & CSS 隐藏内容
+  {G}✔{RS} 可疑 URL 分析（显示/实际域名不一致等）
+  {G}✔{RS} 主题关键词威胁评分 & 时间戳异常检测
+  {G}✔{RS} 多维度联动加分 + 综合 100 分制评分
+
+  {Y}使用方式{RS}  直接输入路径，或将邮件文件拖拽到此窗口
+  {Y}退出{RS}      输入 {W}q{RS} 或按 {W}Ctrl+C{RS}
+""")
+    print(f"{B}{'─'*62}{RS}\n")
 
 
-# 使用示例
-if __name__ == "__main__":
-    # test_file = r"/Users/admin/Downloads/1745443910003.eml"
-    test_file = get_verified_path("file")
+def analyze_one(file_path: str) -> str:
+    """
+    分析单个邮件文件，返回风险等级字符串。
+    异常时返回 'error'。
+    """
+    R  = '\033[1;31m'
+    Y  = '\033[1;33m'
+    G  = '\033[1;32m'
+    C  = '\033[1;36m'
+    RS = '\033[0m'
 
     try:
-        print(f"开始解析邮件: {test_file}")
-        print(f"文件大小: {os.path.getsize(test_file)} 字节")
-        
-        # 解析邮件
-        email_data = parse_email(test_file)
-        
-        # 显示附件统计
-        print(f"\n发现附件数量: {len(email_data['attachments'])}")
-        
-        # 显示报告
+        size = os.path.getsize(file_path)
+        print(f"\n{C}▶  开始分析: {os.path.basename(file_path)}  ({size:,} 字节){RS}")
+        print(f"{'─'*62}")
+
+        email_data = parse_email(file_path)
         display_report(email_data)
-        
+        return 'done'
+
     except Exception as e:
-        print(f"处理失败: {str(e)}")
+        print(f"\n{R}❌  分析失败: {e}{RS}")
         import traceback
         traceback.print_exc()
+        return 'error'
+
+
+if __name__ == "__main__":
+    B  = '\033[1;34m'
+    W  = '\033[1;37m'
+    G  = '\033[1;32m'
+    Y  = '\033[1;33m'
+    R  = '\033[1;31m'
+    RS = '\033[0m'
+
+    print_banner()
+
+    session_total  = 0
+    session_errors = 0
+
+    while True:
+        try:
+            print(f"{W}请输入邮件路径（q 退出）:{RS}")
+            raw = input("  ➤  ").strip(' "\'')
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{G}👋  已退出，本次共分析 {session_total} 封邮件。{RS}\n")
+            break
+
+        if not raw:
+            continue
+
+        if raw.lower() in ('q', 'quit', 'exit'):
+            print(f"\n{G}👋  已退出，本次共分析 {session_total} 封邮件。{RS}\n")
+            break
+
+        # 路径规范化
+        file_path = os.path.normpath(os.path.expanduser(raw))
+
+        if not os.path.exists(file_path):
+            print(f"  {R}⚠  路径不存在，请重新输入{RS}\n")
+            continue
+
+        if not os.path.isfile(file_path):
+            print(f"  {R}⚠  请输入文件路径，不能是目录{RS}\n")
+            continue
+
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in ('.eml', '.msg'):
+            print(f"  {Y}⚠  不支持的文件格式 {ext}，仅支持 .eml / .msg{RS}\n")
+            continue
+
+        session_total += 1
+        result = analyze_one(file_path)
+        if result == 'error':
+            session_errors += 1
+
+        # 分析完成后提示继续
+        print(f"\n{B}{'─'*62}{RS}")
+        print(f"{G}✔  第 {session_total} 封分析完成。继续输入下一封，或输入 q 退出。{RS}")
+        print(f"{B}{'─'*62}{RS}\n")
