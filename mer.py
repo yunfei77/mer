@@ -1418,47 +1418,107 @@ def display_report(email_data: Dict[str, Any]) -> None:
     homo_r     = detect_homograph_attack(email_data)
     time_r     = detect_time_anomaly(email_data)
 
-    # ── 综合评分（各维度满分 → 归一化到 100 分制）──
-    # 权重设计：认证(20) + 域名仿冒(20) + 发件人伪造(15) +
-    #           域名年龄(10) + 隐藏内容(10) + URL(10) +
-    #           附件(10) + 主题(5) + 同形字(5) + 时间(5) = max≈110 压缩到100
+
+    # ══════════════════════════════════════════════
+    # 综合评分（满分 100）
+    # ──────────────────────────────────────────────
+    # 权重设计依据（安全实践）：
+    #
+    # 【极高权重 - 单独触发即高度可疑】
+    #   同形字攻击(15)：几乎100%恶意，无正常使用场景
+    #   附件威胁(15)：可执行文件/宏/双扩展名，直接危害最高
+    #
+    # 【高权重 - 强信号】
+    #   发件人伪造(15)：SPF/Received链不匹配，确认身份欺骗
+    #   邮件认证(15)：SPF/DKIM/DMARC三重失败，发件人可信度极低
+    #   域名仿冒(12)：字符替换/高相似域名，典型钓鱼手法
+    #
+    # 【中权重 - 辅助信号】
+    #   URL风险(10)：链接显示与实际不符，辅助判断
+    #   隐藏内容(8)：跟踪像素等，钓鱼邮件常用
+    #   域名年龄(8)：新注册域名，单独价值中等
+    #
+    # 【低权重 - 弱信号，配合其他使用】
+    #   主题关键词(5)：正常邮件也可能触发
+    #   时间异常(5)：单独出现可能是服务器问题
+    # ──────────────────────────────────────────────
+    # 各维度格式：(原始分, 原始满分, 权重)
     WEIGHTS = {
-        'auth':    (auth_r['risk_score'],    9.0,  20),
-        'domain':  (domain_r['risk_score'],  6.0,  20),
-        'spoof':   (spoof_r['risk_score'],   8.0,  15),
-        'reg':     (reg_r['risk_score'],     5.0,  10),
-        'hidden':  (hidden_r['risk_score'],  8.0,  10),
-        'url':     (url_r['risk_score'],     8.0,  10),
-        'att':     (att_r['risk_score'],    10.0,  10),
-        'subj':    (subj_r['risk_score'],    6.0,   5),
-        'homo':    (homo_r['risk_score'],    4.0,   5),
-        'time':    (time_r['risk_score'],    4.0,   5),
+        'homo':    (homo_r['risk_score'],    4.0,  15),  # 同形字：极高危
+        'att':     (att_r['risk_score'],    10.0,  15),  # 附件威胁：极高危
+        'spoof':   (spoof_r['risk_score'],   8.0,  15),  # 发件伪造：高危
+        'auth':    (auth_r['risk_score'],    9.0,  15),  # 邮件认证：高危
+        'domain':  (domain_r['risk_score'],  6.0,  12),  # 域名仿冒：高危
+        'url':     (url_r['risk_score'],     8.0,  10),  # URL风险：中危
+        'hidden':  (hidden_r['risk_score'],  8.0,   8),  # 隐藏内容：中危
+        'reg':     (reg_r['risk_score'],     5.0,   8),  # 域名年龄：中危
+        'subj':    (subj_r['risk_score'],    6.0,   5),  # 主题词：弱信号
+        'time':    (time_r['risk_score'],    4.0,   5),  # 时间异常：弱信号
     }
+    # 各权重之和 = 108，压缩到100
 
     total_score = 0.0
     for key, (score, max_raw, weight) in WEIGHTS.items():
         normalized = min(score / max_raw, 1.0) * weight if max_raw > 0 else 0
         total_score += normalized
+
+    # ── 联动加分：多个强信号同时命中时额外加分 ──
+    # 钓鱼组合1：域名仿冒 + 域名年龄短（典型新建仿冒域名）
+    if domain_r['risk_level'] == 'high' and reg_r.get('sender_domain', {}).get('age_days', 999) < 90:
+        bonus = 15.0
+        total_score += bonus
+
+    # 钓鱼组合2：发件伪造 + 认证失败（双重身份欺骗）
+    if spoof_r['is_spoofed'] and auth_r['spf']['status'] in ('fail', 'softfail'):
+        total_score += 10.0
+
+    # 钓鱼组合3：域名仿冒 + 可疑URL（视觉欺骗配合链接劫持）
+    if domain_r['risk_level'] == 'high' and url_r['risk_level'] in ('high', 'medium'):
+        total_score += 8.0
+
+    # 钓鱼组合4：同形字 + 任意其他高危信号（几乎确认恶意）
+    if homo_r['risk_score'] >= 4 and any([
+        auth_r['risk_level'] == 'high',
+        domain_r['risk_level'] == 'high',
+        spoof_r['is_spoofed'],
+    ]):
+        total_score += 12.0
+
     total_score = min(total_score, 100.0)
 
-    if total_score >= 75:
+    # ── 风险等级阈值（相比旧版更严格）──
+    if total_score >= 65:
         overall_level = 'critical'
-    elif total_score >= 50:
+    elif total_score >= 40:
         overall_level = 'high'
-    elif total_score >= 25:
+    elif total_score >= 20:
         overall_level = 'medium'
     else:
         overall_level = 'low'
 
-    # ── 是否确认恶意邮件（多维度高危同时触发）──
+    # ── 恶意判定：满足任一条件 ──
+    # 1. 综合评分高
+    # 2. 极强单一信号（同形字/可执行附件）
+    # 3. 三个以上高危信号联合
     high_signals = sum([
-        auth_r['risk_level']   in ('high',),
-        domain_r['risk_level'] in ('high',),
-        spoof_r['risk_level']  in ('high',),
-        att_r['risk_level']    in ('high', 'critical'),
-        homo_r['risk_score']   >= 4,
+        auth_r['spf']['status'] in ('fail',),
+        auth_r['dkim']['status'] in ('fail',),
+        domain_r['risk_level'] == 'high',
+        spoof_r['is_spoofed'],
+        att_r['risk_level'] in ('high', 'critical'),
+        homo_r['risk_score'] >= 4,
+        reg_r.get('sender_domain', {}).get('age_days', 999) < 30,
+        url_r['risk_level'] == 'high',
     ])
-    is_malicious = (total_score >= 60) or (high_signals >= 3)
+    is_malicious = (
+        total_score >= 55
+        or homo_r['risk_score'] >= 4          # 同形字单独触发
+        or att_r['risk_score'] >= 8            # 可执行附件/双扩展名单独触发
+        or high_signals >= 4                   # 4个及以上高危信号
+        or (domain_r['risk_level'] == 'high'   # 域名仿冒 + 新域名（≤30天）
+            and reg_r.get('sender_domain', {}).get('age_days', 999) <= 30)
+    )
+
 
     # ══════════════════════════════════════════════
     # 顶部横幅
@@ -1675,9 +1735,16 @@ def display_report(email_data: Dict[str, Any]) -> None:
 
     # 各维度得分小结
     dim_names = {
-        'auth':'认证', 'domain':'域名仿冒', 'spoof':'发件伪造',
-        'reg':'域名年龄', 'hidden':'隐藏内容', 'url':'URL',
-        'att':'附件', 'subj':'主题', 'homo':'同形字', 'time':'时间'
+        'homo':   '同形字攻击',
+        'att':    '附件威胁',
+        'spoof':  '发件伪造',
+        'auth':   '邮件认证',
+        'domain': '域名仿冒',
+        'url':    'URL风险',
+        'hidden': '隐藏内容',
+        'reg':    '域名年龄',
+        'subj':   '主题关键词',
+        'time':   '时间异常',
     }
     print(f"\n  {'维度':<10} {'原始分':>6}  {'贡献分':>6}")
     print(f"  {'─'*28}")
