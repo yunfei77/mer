@@ -32,19 +32,20 @@ def parse_email(file_path: str) -> Dict[str, Any]:
         包含邮件信息的字典
     """
     email_data = {
-        'from': [],      # 所有发件人
-        'to': [],        # 所有收件人
-        'cc': [],        # 抄送人
-        'bcc': [],       # 密送人
-        'reply_to': [],  # 回复地址
-        'subject': '',   # 主题
-        'date': '',      # 日期
-        'body_text': '', # 纯文本正文
-        'body_html': '', # HTML正文
-        'attachments': [], # 附件列表
-        'references': [], # 引用的邮件ID
-        'in_reply_to': [], # 回复的邮件ID
-        'thread_info': {  # 邮件会话信息
+        'from': [],
+        'to': [],
+        'cc': [],
+        'bcc': [],
+        'reply_to': [],
+        'subject': '',
+        'date': '',
+        'body_text': '',
+        'body_html': '',
+        'attachments': [],
+        'references': [],
+        'in_reply_to': [],
+        'headers': {},        # 新增：完整原始 headers
+        'thread_info': {
             'original_sender': '',
             'original_recipients': [],
             'original_subject': '',
@@ -93,6 +94,17 @@ def parse_email(file_path: str) -> Dict[str, Any]:
                 # 处理主题和日期
                 email_data['subject'] = msg.get('Subject', '')
                 email_data['date'] = msg.get('Date', '')
+
+                # 提取所有原始 headers（供 SPF/DKIM/DMARC/Received 检测使用）
+                for key in msg.keys():
+                    k = key.lower()
+                    val = str(msg.get(key, ''))
+                    if k == 'received':
+                        email_data['headers'].setdefault('received', [])
+                        if isinstance(email_data['headers']['received'], list):
+                            email_data['headers']['received'].append(val)
+                    else:
+                        email_data['headers'][k] = val
                 
                 # 处理邮件引用和回复信息
                 references = msg.get('References', '')
@@ -571,6 +583,325 @@ def parse_attachment(attachment: Any, attachment_index: int) -> Dict[str, Any]:
     
     return attachment_info
 
+# ========== 公共工具函数 ==========
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """计算两个字符串的编辑距离"""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            current_row.append(min(
+                previous_row[j + 1] + 1,
+                current_row[j] + 1,
+                previous_row[j] + (c1 != c2)
+            ))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def analyze_domain_similarity(domain1: str, domain2: str) -> Dict[str, Any]:
+    """
+    分析两个域名之间的相似关系。
+    返回 {'similarity': float, 'relationship_type': str|None, 'risk': str}
+    """
+    if not domain1 or not domain2 or domain1 == domain2:
+        return {'similarity': 0.0, 'relationship_type': None, 'risk': 'low'}
+
+    base1 = domain1.split('.')[0].lower()
+    base2 = domain2.split('.')[0].lower()
+
+    # 1. 字符替换（sinopc → sinopec，差1个字符）
+    if abs(len(base1) - len(base2)) <= 1:
+        diff = sum(c1 != c2 for c1, c2 in zip(base1, base2))
+        if diff <= 1:
+            return {'similarity': 0.95, 'relationship_type': '可疑的字符替换', 'risk': 'high'}
+
+    # 2. 字母顺序调换（anagram）
+    if sorted(base1) == sorted(base2) and base1 != base2:
+        return {'similarity': 1.0, 'relationship_type': '字母顺序调换', 'risk': 'high'}
+
+    # 3. 包含关系 + 可疑追加词
+    suspicious_additions = {
+        'portal', 'service', 'vendor', 'secure', 'mail',
+        'auth', 'login', 'account', 'verify', 'update', 'support'
+    }
+    if base1 in base2 or base2 in base1:
+        longer  = base1 if len(base1) > len(base2) else base2
+        shorter = base2 if len(base1) > len(base2) else base1
+        remaining = longer.replace(shorter, '').lower()
+        if any(w in remaining for w in suspicious_additions):
+            return {'similarity': 0.9, 'relationship_type': '可疑的域名包含', 'risk': 'high'}
+
+    # 4. 编辑距离相似度
+    dist = levenshtein_distance(base1, base2)
+    max_len = max(len(base1), len(base2))
+    similarity = 1 - dist / max_len if max_len else 0
+    if similarity > 0.8:
+        return {'similarity': similarity, 'relationship_type': '高度相似', 'risk': 'high'}
+
+    return {'similarity': similarity, 'relationship_type': None, 'risk': 'low'}
+
+
+def extract_email_domain(email_str: str) -> str:
+    """从邮箱地址字符串中提取域名"""
+    m = re.search(r'@([\w.-]+)', email_str)
+    return m.group(1).lower() if m else ''
+
+
+def extract_url_domain(url: str) -> str:
+    """从 URL 中提取域名"""
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ''
+
+
+def risk_label(score: float) -> str:
+    """根据分数返回风险等级标签"""
+    if score >= 7:   return 'critical'
+    if score >= 5:   return 'high'
+    if score >= 2.5: return 'medium'
+    if score > 0:    return 'low'
+    return 'low'
+
+
+def fmt_risk(level: str) -> str:
+    """带颜色的风险等级字符串（ANSI）"""
+    colors = {
+        'critical': '\033[1;35m',  # 紫
+        'high':     '\033[1;31m',  # 红
+        'medium':   '\033[1;33m',  # 黄
+        'low':      '\033[1;32m',  # 绿
+        'unknown':  '\033[0m',
+    }
+    reset = '\033[0m'
+    c = colors.get(level.lower(), reset)
+    return f"{c}{level.upper()}{reset}"
+
+
+def _sep(title: str = '', width: int = 60) -> str:
+    if title:
+        pad = (width - len(title) - 2) // 2
+        return '─' * pad + f' {title} ' + '─' * pad
+    return '─' * width
+
+
+# ========== 新增检测方法 ==========
+
+def detect_homograph_attack(email_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    检测同形字攻击（Homograph/IDN Homograph Attack）：
+    使用 Unicode 字符（如西里尔字母 а≠a）伪装域名。
+    """
+    result = {
+        'suspicious': [],
+        'risk_level': 'low',
+        'risk_score': 0.0,
+        'warnings': []
+    }
+
+    # ASCII 范围之外的字母映射（常见混淆字符集）
+    confusables = {
+        'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
+        'х': 'x', 'у': 'y', 'і': 'i', 'ԁ': 'd', 'ɡ': 'g',
+        'ⅼ': 'l', '０': '0', '１': '1', '２': '2',
+    }
+
+    def has_confusable(s: str) -> bool:
+        return any(c in confusables for c in s)
+
+    addresses = (
+        email_data.get('from', []) +
+        email_data.get('to', []) +
+        email_data.get('reply_to', [])
+    )
+    for addr in addresses:
+        if has_confusable(addr):
+            result['suspicious'].append(addr)
+            result['risk_score'] += 4.0
+            result['warnings'].append(
+                f'地址含同形混淆字符（可能是仿冒域名）: {addr}'
+            )
+
+    if result['risk_score'] >= 4:
+        result['risk_level'] = 'high'
+
+    return result
+
+
+def detect_suspicious_subject(email_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    基于主题关键词的威胁评分。
+    涵盖：紧迫感、金融诱导、账户威胁、凭证钓鱼等常见主题词。
+    """
+    result = {
+        'matched_keywords': [],
+        'risk_level': 'low',
+        'risk_score': 0.0,
+        'warnings': []
+    }
+
+    HIGH_RISK = [
+        '紧急', '立即', '马上', 'urgent', 'immediate', 'action required',
+        '账号被冻结', '账户异常', '密码过期', 'password expired',
+        '验证失败', 'verify your account', '点击此处', 'click here',
+        '您的账户', '安全警告', 'security alert', '中奖', 'winner',
+        '汇款', '转账', 'wire transfer', '发票', 'invoice',
+        '退款', 'refund', '付款确认', 'payment confirmation',
+        '报价', 'quotation', '合同', 'contract',
+    ]
+    MED_RISK = [
+        '通知', 'notification', '更新', 'update', '确认', 'confirm',
+        '重要', 'important', '提醒', 'reminder',
+    ]
+
+    subject = email_data.get('subject', '').lower()
+    for kw in HIGH_RISK:
+        if kw.lower() in subject:
+            result['matched_keywords'].append(kw)
+            result['risk_score'] += 2.0
+    for kw in MED_RISK:
+        if kw.lower() in subject:
+            result['matched_keywords'].append(kw)
+            result['risk_score'] += 0.5
+
+    result['risk_level'] = risk_label(result['risk_score'])
+    if result['matched_keywords']:
+        result['warnings'].append(
+            f"主题含高风险关键词: {', '.join(set(result['matched_keywords']))}"
+        )
+    return result
+
+
+def detect_suspicious_attachments(email_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    增强附件风险检测：
+    - 双扩展名（report.pdf.exe）
+    - 伪装为图片/文档的可执行文件
+    - 压缩包内含可执行文件
+    - 宏文档（.docm/.xlsm）
+    """
+    result = {
+        'suspicious': [],
+        'risk_level': 'low',
+        'risk_score': 0.0,
+        'warnings': []
+    }
+
+    EXEC_EXT = {
+        '.exe', '.dll', '.bat', '.cmd', '.msi', '.vbs', '.vbe',
+        '.js', '.jse', '.ps1', '.psm1', '.com', '.scr', '.hta',
+        '.pif', '.lnk', '.jar', '.wsf', '.wsh', '.reg'
+    }
+    MACRO_EXT = {'.docm', '.xlsm', '.pptm', '.dotm', '.xltm', '.potm'}
+    DOUBLE_EXT_RE = re.compile(
+        r'\.(pdf|doc|docx|xls|xlsx|jpg|png|txt|zip)\.'
+        r'(exe|bat|cmd|vbs|js|ps1|scr|com|pif|lnk)$',
+        re.IGNORECASE
+    )
+
+    for att in email_data.get('attachments', []):
+        fname = att.get('filename', '')
+        ext   = att.get('extension', '').lower()
+        issues = []
+
+        # 双扩展名
+        if DOUBLE_EXT_RE.search(fname):
+            issues.append(f'双扩展名伪装: {fname}')
+            result['risk_score'] += 5.0
+
+        # 可执行文件
+        if ext in EXEC_EXT:
+            issues.append(f'可执行文件: {fname}')
+            result['risk_score'] += 4.0
+
+        # 宏文档
+        if ext in MACRO_EXT:
+            issues.append(f'含宏的文档（可能自动执行恶意代码）: {fname}')
+            result['risk_score'] += 3.0
+
+        # 压缩包内含可执行文件
+        archive_contents = att.get('archive_contents', [])
+        exec_in_archive = [
+            f for f in archive_contents
+            if os.path.splitext(f)[1].lower() in EXEC_EXT
+        ]
+        if exec_in_archive:
+            issues.append(
+                f'压缩包 {fname} 内含可执行文件: {", ".join(exec_in_archive[:3])}'
+            )
+            result['risk_score'] += 4.0
+
+        if issues:
+            result['suspicious'].append({'filename': fname, 'issues': issues})
+            result['warnings'].extend(issues)
+
+    result['risk_level'] = risk_label(result['risk_score'])
+    return result
+
+
+def detect_time_anomaly(email_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    检测邮件头时间异常：
+    - Date 与 Received 时间戳相差过大（>24h，说明被延迟/伪造）
+    - Date 为未来时间
+    """
+    result = {
+        'risk_level': 'low',
+        'risk_score': 0.0,
+        'warnings': []
+    }
+
+    date_str = email_data.get('date', '')
+    if not date_str:
+        return result
+
+    try:
+        from email.utils import parsedate_to_datetime
+        mail_dt = parsedate_to_datetime(date_str)
+        now = datetime.now(timezone.utc)
+
+        # 未来时间
+        if mail_dt > now:
+            diff_h = (mail_dt - now).total_seconds() / 3600
+            result['risk_score'] += 3.0
+            result['warnings'].append(
+                f'邮件日期({date_str})早于当前时间 {diff_h:.1f} 小时，疑似伪造时间戳'
+            )
+
+        # 与 Received 链中首个时间戳对比
+        headers = email_data.get('headers', {})
+        received_list = headers.get('received', [])
+        if isinstance(received_list, str):
+            received_list = [received_list]
+
+        for rcv in received_list[:1]:
+            # Received 头尾部通常有时间戳（;后面）
+            ts_match = re.search(r';\s*(.+)$', rcv)
+            if ts_match:
+                try:
+                    rcv_dt = parsedate_to_datetime(ts_match.group(1).strip())
+                    diff_sec = abs((mail_dt - rcv_dt).total_seconds())
+                    if diff_sec > 86400:  # 超过24小时
+                        result['risk_score'] += 2.0
+                        result['warnings'].append(
+                            f'邮件Date与Received时间戳相差 {diff_sec/3600:.1f} 小时，可能被延迟或时间伪造'
+                        )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    result['risk_level'] = risk_label(result['risk_score'])
+    return result
+
+
 def extract_urls(email_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     从邮件中提取所有URL并进行安全分析
@@ -591,157 +922,57 @@ def extract_urls(email_data: Dict[str, Any]) -> Dict[str, Any]:
         # URL正则表达式模式
         url_pattern = r'(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»""'']))'
         
-        def extract_domain(url: str) -> str:
-            """从URL中提取域名"""
-            try:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                return parsed.netloc.lower()
-            except:
-                return ''
-        
-        def analyze_domain_relationship(domain1: str, domain2: str) -> Dict[str, Any]:
-            """分析两个域名之间的关系"""
-            if not domain1 or not domain2:
-                return {'similarity': 0.0, 'relationship_type': None, 'risk': 'low'}
-            
-            base1 = domain1.split('.')[0]
-            base2 = domain2.split('.')[0]
-            
-            result = {
-                'similarity': 0.0,
-                'relationship_type': None,
-                'risk': 'low'
-            }
-            
-            # 1. 检查完全匹配
-            if domain1 == domain2:
-                return result
-            
-            # 2. 检查字符替换（如 sinopec -> siuopec）
-            if abs(len(base1) - len(base2)) <= 1:
-                diff_count = 0
-                for c1, c2 in zip(base1, base2):
-                    if c1 != c2:
-                        diff_count += 1
-                        if diff_count > 1:
-                            break
-                if diff_count <= 1:
-                    result['similarity'] = 0.95
-                    result['relationship_type'] = '可疑的字符替换'
-                    result['risk'] = 'high'
-                    return result
-            
-            # 3. 检查包含关系
-            if base1 in base2 or base2 in base1:
-                longer = base1 if len(base1) > len(base2) else base2
-                shorter = base2 if len(base1) > len(base2) else base1
-                
-                if shorter in longer:
-                    suspicious_additions = {'portal', 'service', 'vendor', 'secure', 'mail', 
-                                         'auth', 'login', 'account', 'verify', 'update'}
-                    remaining = longer.replace(shorter, '').lower()
-                    
-                    if any(word in remaining for word in suspicious_additions):
-                        result['similarity'] = 0.9
-                        result['relationship_type'] = '可疑的域名包含'
-                        result['risk'] = 'high'
-                        return result
-            
-            # 4. 计算编辑距离相似度
-            def levenshtein_distance(s1: str, s2: str) -> int:
-                if len(s1) < len(s2):
-                    return levenshtein_distance(s2, s1)
-                if len(s2) == 0:
-                    return len(s1)
-                previous_row = range(len(s2) + 1)
-                for i, c1 in enumerate(s1):
-                    current_row = [i + 1]
-                    for j, c2 in enumerate(s2):
-                        insertions = previous_row[j + 1] + 1
-                        deletions = current_row[j] + 1
-                        substitutions = previous_row[j] + (c1 != c2)
-                        current_row.append(min(insertions, deletions, substitutions))
-                    previous_row = current_row
-                return previous_row[-1]
-            
-            distance = levenshtein_distance(base1, base2)
-            max_length = max(len(base1), len(base2))
-            similarity = 1 - (distance / max_length)
-            
-            if similarity > 0.8:
-                result['similarity'] = similarity
-                result['relationship_type'] = '高度相似'
-                result['risk'] = 'high'
-            
-            return result
-        
         def analyze_link_safety(display_text: str, actual_url: str, email_domains: List[str]) -> Dict[str, Any]:
             """分析超链接的安全性"""
-            result = {
+            res = {
                 'display_text': display_text,
                 'actual_url': actual_url,
                 'risk_level': 'low',
                 'risk_score': 0.0,
                 'reasons': []
             }
-            
-            # 1. 检查显示文本是否包含URL
-            display_domain = None
-            if re.search(url_pattern, display_text):
-                display_domain = extract_domain(display_text)
-            
-            # 2. 获取实际URL的域名
-            actual_domain = extract_domain(actual_url)
-            
+
+            display_domain = extract_url_domain(display_text) if re.search(url_pattern, display_text) else None
+            actual_domain  = extract_url_domain(actual_url)
+
             if display_domain and actual_domain and display_domain != actual_domain:
-                result['risk_score'] += 3.0
-                result['reasons'].append(f"超链接显示域名({display_domain})与实际域名({actual_domain})不匹配")
-            
-            # 3. 检查域名与邮件发件人域名的相似度
+                res['risk_score'] += 3.0
+                res['reasons'].append(
+                    f"超链接显示域名({display_domain})与实际域名({actual_domain})不匹配"
+                )
+
             for email_domain in email_domains:
                 if actual_domain:
-                    analysis = analyze_domain_relationship(actual_domain, email_domain)
+                    analysis = analyze_domain_similarity(actual_domain, email_domain)
                     if analysis['risk'] == 'high':
-                        result['risk_score'] += 2.5
-                        result['reasons'].append(
+                        res['risk_score'] += 2.5
+                        res['reasons'].append(
                             f"URL域名({actual_domain})与邮件域名({email_domain})高度相似: "
                             f"{analysis['relationship_type']}"
                         )
-            
-            # 4. 检查URL的其他可疑特征
+
             try:
                 from urllib.parse import urlparse, parse_qs
                 parsed = urlparse(actual_url)
-                
-                # 检查非标准端口
                 if parsed.port and parsed.port not in (80, 443):
-                    result['risk_score'] += 2.0
-                    result['reasons'].append(f"使用非标准端口: {parsed.port}")
-                
-                # 检查URL编码过度
+                    res['risk_score'] += 2.0
+                    res['reasons'].append(f"使用非标准端口: {parsed.port}")
                 if actual_url.count('%') > 5:
-                    result['risk_score'] += 1.5
-                    result['reasons'].append("URL过度编码，可能试图隐藏真实地址")
-                
-                # 检查重定向参数
+                    res['risk_score'] += 1.5
+                    res['reasons'].append("URL过度编码，可能试图隐藏真实地址")
                 redirect_params = {'url', 'redirect', 'goto', 'link', 'return', 'target'}
-                query_params = parse_qs(parsed.query)
-                found_redirects = set(query_params.keys()) & redirect_params
+                found_redirects = set(parse_qs(parsed.query).keys()) & redirect_params
                 if found_redirects:
-                    result['risk_score'] += 2.0
-                    result['reasons'].append(f"包含重定向参数: {', '.join(found_redirects)}")
-            
+                    res['risk_score'] += 2.0
+                    res['reasons'].append(f"包含重定向参数: {', '.join(found_redirects)}")
             except Exception as e:
                 print(f"URL分析失败: {str(e)}")
-            
-            # 设置最终风险等级
-            if result['risk_score'] >= 3.0:
-                result['risk_level'] = 'high'
-            elif result['risk_score'] >= 1.5:
-                result['risk_level'] = 'medium'
-            
-            return result
+
+            if res['risk_score'] >= 3.0:
+                res['risk_level'] = 'high'
+            elif res['risk_score'] >= 1.5:
+                res['risk_level'] = 'medium'
+            return res
         
         # 获取邮件相关的域名列表
         email_domains = set()
@@ -1068,14 +1299,25 @@ def verify_email_auth(email_data: Dict[str, Any]) -> Dict[str, Any]:
                     auth_results['dmarc']['policy'] = policy_match.group(1)
         
         # 5. 分析认证头信息
-        if 'Authentication-Results' in email_data.get('headers', {}):
-            auth_header = email_data['headers']['Authentication-Results']
+        headers = email_data.get('headers', {})
+
+        # 读取 Authentication-Results（可能有多条）
+        auth_header = headers.get('authentication-results', '')
+        if auth_header:
             auth_results['authentication_results'] = auth_header
-            
-            # 解析认证结果
             parse_spf_result(auth_header)
             parse_dkim_result(auth_header)
             parse_dmarc_result(auth_header)
+
+        # 读取 Received-SPF（备用 SPF 来源）
+        received_spf = headers.get('received-spf', '')
+        if received_spf and auth_results['spf']['status'] == 'unknown':
+            parse_spf_result(received_spf)
+
+        # 读取 DKIM-Signature
+        dkim_sig = headers.get('dkim-signature', '')
+        if dkim_sig and auth_results['dkim']['status'] == 'unknown':
+            parse_dkim_result(dkim_sig)
         
         # 6. 评估风险等级
         risk_score = 0.0
@@ -1135,359 +1377,326 @@ def verify_email_auth(email_data: Dict[str, Any]) -> Dict[str, Any]:
     return auth_results
 
 def display_report(email_data: Dict[str, Any]) -> None:
-    """
-    显示邮件分析报告
-    
-    Args:
-        email_data: 邮件解析数据
-    """
-    print("\n=== 邮件分析报告 ===")
-    
-    # 显示发件人
-    print("\n[1] 发件人信息:")
-    if email_data['from']:
-        for i, sender in enumerate(email_data['from'], 1):
-            print(f"发件人 {i}: {sender}")
+    """显示邮件分析报告（彩色高亮 + 综合评分）"""
+
+    # ── ANSI 颜色常量 ──
+    R  = '\033[1;31m'   # 红（高危）
+    Y  = '\033[1;33m'   # 黄（中危）
+    G  = '\033[1;32m'   # 绿（低危/正常）
+    C  = '\033[1;36m'   # 青（信息）
+    B  = '\033[1;34m'   # 蓝（标题）
+    W  = '\033[1;37m'   # 白粗体
+    RS = '\033[0m'      # 重置
+
+    def clr(text, level):
+        """按风险等级着色"""
+        m = {'critical': R, 'high': R, 'medium': Y, 'low': G, 'unknown': W}
+        return f"{m.get(level.lower(), W)}{text}{RS}"
+
+    def warn(msg, level='high'):
+        c = R if level in ('critical', 'high') else Y
+        print(f"  {c}⚠  {msg}{RS}")
+
+    def ok(msg):
+        print(f"  {G}✔  {msg}{RS}")
+
+    def section(num, title):
+        print(f"\n{B}{'─'*60}{RS}")
+        print(f"{W}[{num}] {title}{RS}")
+
+    # ══════════════════════════════════════════════
+    # 先运行所有检测，收集分数，最后汇总
+    # ══════════════════════════════════════════════
+    auth_r     = verify_email_auth(email_data)
+    domain_r   = check_similar_domains(email_data)
+    spoof_r    = detect_spoofed_sender(email_data)
+    reg_r      = analyze_domain_registration(email_data)
+    hidden_r   = detect_hidden_content(email_data)
+    url_r      = extract_urls(email_data)
+    att_r      = detect_suspicious_attachments(email_data)
+    subj_r     = detect_suspicious_subject(email_data)
+    homo_r     = detect_homograph_attack(email_data)
+    time_r     = detect_time_anomaly(email_data)
+
+    # ── 综合评分（各维度满分 → 归一化到 100 分制）──
+    # 权重设计：认证(20) + 域名仿冒(20) + 发件人伪造(15) +
+    #           域名年龄(10) + 隐藏内容(10) + URL(10) +
+    #           附件(10) + 主题(5) + 同形字(5) + 时间(5) = max≈110 压缩到100
+    WEIGHTS = {
+        'auth':    (auth_r['risk_score'],    9.0,  20),
+        'domain':  (domain_r['risk_score'],  6.0,  20),
+        'spoof':   (spoof_r['risk_score'],   8.0,  15),
+        'reg':     (reg_r['risk_score'],     5.0,  10),
+        'hidden':  (hidden_r['risk_score'],  8.0,  10),
+        'url':     (url_r['risk_score'],     8.0,  10),
+        'att':     (att_r['risk_score'],    10.0,  10),
+        'subj':    (subj_r['risk_score'],    6.0,   5),
+        'homo':    (homo_r['risk_score'],    4.0,   5),
+        'time':    (time_r['risk_score'],    4.0,   5),
+    }
+
+    total_score = 0.0
+    for key, (score, max_raw, weight) in WEIGHTS.items():
+        normalized = min(score / max_raw, 1.0) * weight if max_raw > 0 else 0
+        total_score += normalized
+    total_score = min(total_score, 100.0)
+
+    if total_score >= 75:
+        overall_level = 'critical'
+    elif total_score >= 50:
+        overall_level = 'high'
+    elif total_score >= 25:
+        overall_level = 'medium'
     else:
-        print("未找到发件人信息")
+        overall_level = 'low'
+
+    # ── 是否确认恶意邮件（多维度高危同时触发）──
+    high_signals = sum([
+        auth_r['risk_level']   in ('high',),
+        domain_r['risk_level'] in ('high',),
+        spoof_r['risk_level']  in ('high',),
+        att_r['risk_level']    in ('high', 'critical'),
+        homo_r['risk_score']   >= 4,
+    ])
+    is_malicious = (total_score >= 60) or (high_signals >= 3)
+
+    # ══════════════════════════════════════════════
+    # 顶部横幅
+    # ══════════════════════════════════════════════
+    print(f"\n{B}{'═'*60}{RS}")
+    print(f"{W}  📧  邮件安全分析报告{RS}")
+    print(f"{B}{'═'*60}{RS}")
+
+    if is_malicious:
+        print(f"\n{R}{'█'*60}{RS}")
+        print(f"{R}  ‼‼  高度疑似恶意邮件！请勿点击任何链接或附件！  ‼‼{RS}")
+        print(f"{R}{'█'*60}{RS}")
     
-    # 显示收件人
-    print("\n[2] 收件人信息:")
-    if email_data['to']:
-        for i, recipient in enumerate(email_data['to'], 1):
-            print(f"收件人 {i}: {recipient}")
-    else:
-        print("未找到收件人信息")
-    
-    # 显示抄送人
+    # 综合评分展示
+    bar_filled = int(total_score / 5)
+    bar = f"{'█' * bar_filled}{'░' * (20 - bar_filled)}"
+    score_color = R if total_score >= 60 else (Y if total_score >= 30 else G)
+    print(f"\n  综合风险评分: {score_color}{total_score:.1f} / 100  [{bar}]{RS}")
+    print(f"  综合风险等级: {clr(overall_level.upper(), overall_level)}")
+
+    # ══════════════════════════════════════════════
+    # [1] 基本信息
+    # ══════════════════════════════════════════════
+    section(1, '基本信息')
+    print(f"  发件人: {W}{', '.join(email_data['from']) or '未知'}{RS}")
+    print(f"  收件人: {', '.join(email_data['to']) or '未知'}")
     if email_data['cc']:
-        print("\n[3] 抄送人信息:")
-        for i, cc in enumerate(email_data['cc'], 1):
-            print(f"抄送人 {i}: {cc}")
-    
-    # 显示密送人
-    if email_data['bcc']:
-        print("\n[4] 密送人信息:")
-        for i, bcc in enumerate(email_data['bcc'], 1):
-            print(f"密送人 {i}: {bcc}")
-    
-    # 显示回复地址
+        print(f"  抄送:   {', '.join(email_data['cc'])}")
     if email_data['reply_to']:
-        print("\n[5] 回复地址:")
-        for i, reply_to in enumerate(email_data['reply_to'], 1):
-            print(f"回复地址 {i}: {reply_to}")
-    
-    # 显示主题和日期
-    print("\n[6] 邮件信息:")
-    print(f"主题: {email_data['subject'] or '未知'}")
-    print(f"日期: {email_data['date'] or '未知'}")
-    
-    # 显示原始邮件信息
-    if any(email_data['thread_info'].values()):
-        print("\n[7] 原始邮件信息:")
-        if email_data['thread_info']['original_sender']:
-            print(f"原始发件人: {email_data['thread_info']['original_sender']}")
-        if email_data['thread_info']['original_recipients']:
-            print("原始收件人:")
-            for i, recipient in enumerate(email_data['thread_info']['original_recipients'], 1):
-                print(f"  收件人 {i}: {recipient}")
-        if email_data['thread_info']['original_subject']:
-            print(f"原始主题: {email_data['thread_info']['original_subject']}")
-        if email_data['thread_info']['original_date']:
-            print(f"原始日期: {email_data['thread_info']['original_date']}")
-    
-    # 改进正文信息显示
-    print("\n[8] 正文信息:")
+        from_d  = extract_email_domain(email_data['from'][0]) if email_data['from'] else ''
+        reply_d = extract_email_domain(email_data['reply_to'][0])
+        rt_str  = ', '.join(email_data['reply_to'])
+        if from_d and reply_d and from_d != reply_d:
+            print(f"  回复地址: {R}{rt_str}  ← 与发件人域名不同！{RS}")
+        else:
+            print(f"  回复地址: {rt_str}")
+    print(f"  主题:   {W}{email_data['subject'] or '未知'}{RS}")
+    print(f"  日期:   {email_data['date'] or '未知'}")
+
+    # 时间异常
+    if time_r['warnings']:
+        for w in time_r['warnings']:
+            warn(w, 'medium')
+
+    # 主题高危关键词
+    if subj_r['matched_keywords']:
+        warn(f"主题含高风险关键词: {', '.join(set(subj_r['matched_keywords']))}", 'medium')
+
+    # 同形字攻击
+    if homo_r['suspicious']:
+        for w in homo_r['warnings']:
+            warn(w, 'high')
+
+    # ══════════════════════════════════════════════
+    # [2] 邮件认证（SPF / DKIM / DMARC）
+    # ══════════════════════════════════════════════
+    section(2, f'邮件认证  风险: {clr(auth_r["risk_level"].upper(), auth_r["risk_level"])}  得分贡献: {min(auth_r["risk_score"]/9,1)*20:.1f}/20')
+
+    def auth_status(name, status):
+        if status == 'pass':
+            ok(f"{name}: {G}PASS{RS}")
+        elif status in ('fail', 'softfail'):
+            warn(f"{name}: {status.upper()} — 验证失败，发件人可能被伪造", 'high')
+        elif status == 'unknown':
+            print(f"  {Y}?  {name}: 未知/未找到{RS}")
+        else:
+            print(f"  {W}·  {name}: {status}{RS}")
+
+    auth_status('SPF',   auth_r['spf']['status'])
+    auth_status('DKIM',  auth_r['dkim']['status'])
+    auth_status('DMARC', auth_r['dmarc']['status'])
+
+    for w in auth_r['warnings']:
+        warn(w)
+
+    # ══════════════════════════════════════════════
+    # [3] 发件人真实性
+    # ══════════════════════════════════════════════
+    section(3, f'发件人真实性  风险: {clr(spoof_r["risk_level"].upper(), spoof_r["risk_level"])}  得分贡献: {min(spoof_r["risk_score"]/8,1)*15:.1f}/15')
+
+    if spoof_r['is_spoofed']:
+        for w in spoof_r['warnings']:
+            warn(w)
+    else:
+        ok('未发现发件人伪造迹象')
+
+    # ══════════════════════════════════════════════
+    # [4] 域名相似度（仿冒检测）
+    # ══════════════════════════════════════════════
+    section(4, f'域名仿冒检测  风险: {clr(domain_r["risk_level"].upper(), domain_r["risk_level"])}  得分贡献: {min(domain_r["risk_score"]/6,1)*20:.1f}/20')
+
+    if domain_r['similar_domains']:
+        for item in domain_r['similar_domains']:
+            warn(
+                f"可疑域名对: {item['domain1']}  ↔  {item['domain2']}"
+                f"  ({item['relationship']}  相似度:{item['similarity']:.0%})",
+                'high'
+            )
+        for w in domain_r['warnings']:
+            if '\n' in w:
+                for line in w.split('\n'):
+                    if line.strip():
+                        warn(line.strip())
+    else:
+        ok('未发现可疑相似域名')
+
+    # ══════════════════════════════════════════════
+    # [5] 域名注册信息
+    # ══════════════════════════════════════════════
+    section(5, f'域名注册信息  风险: {clr(reg_r["risk_level"].upper(), reg_r["risk_level"])}  得分贡献: {min(reg_r["risk_score"]/5,1)*10:.1f}/10')
+
+    for key, label in [('sender_domain', '发件人'), ('recipient_domain', '收件人')]:
+        info = reg_r.get(key)
+        if not info:
+            continue
+        age  = info.get('age_days')
+        lvl  = info.get('risk_level', 'low')
+        age_str = f"{age} 天" if age is not None else '未知'
+        line = f"{label}域名 {info['domain']}  注册年龄: {age_str}"
+        if lvl in ('critical', 'high'):
+            warn(line, lvl)
+        else:
+            print(f"  {G}·{RS}  {line}  ({clr(lvl.upper(), lvl)})")
+
+    for w in reg_r['warnings']:
+        warn(w, 'medium')
+
+    # ══════════════════════════════════════════════
+    # [6] 隐藏内容 & 跟踪器
+    # ══════════════════════════════════════════════
+    section(6, f'隐藏内容/跟踪器  风险: {clr(hidden_r["risk_level"].upper(), hidden_r["risk_level"])}  得分贡献: {min(hidden_r["risk_score"]/8,1)*10:.1f}/10')
+
+    if hidden_r['risk_level'] == 'low' and not hidden_r['tracking_elements']:
+        ok('未发现隐藏内容或跟踪器')
+    else:
+        for item in hidden_r['tracking_elements']:
+            warn(f"跟踪元素 [{item['type']}]: {item.get('url','')[:80]}  — {item['reason']}")
+        for item in hidden_r['hidden_content']:
+            warn(f"隐藏内容 [{item['type']}]: {item['content'][:60]}...", 'medium')
+        for item in hidden_r['suspicious_urls']:
+            warn(f"可疑URL [{item['type']}]: {item['url'][:80]}  — {item['reason']}", 'medium')
+
+    # ══════════════════════════════════════════════
+    # [7] URL 分析
+    # ══════════════════════════════════════════════
+    section(7, f'URL分析  风险: {clr(url_r["risk_level"].upper(), url_r["risk_level"])}  得分贡献: {min(url_r["risk_score"]/8,1)*10:.1f}/10')
+
+    total_urls = sum(len(v) for v in url_r['urls'].values())
+    print(f"  共发现 {total_urls} 个URL（文本:{len(url_r['urls']['text'])}  HTML:{len(url_r['urls']['html'])}  附件:{len(url_r['urls']['attachments'])}）")
+
+    if url_r['suspicious_links']:
+        print(f"  {R}发现 {len(url_r['suspicious_links'])} 个可疑链接:{RS}")
+        for lnk in url_r['suspicious_links']:
+            warn(f"显示: {lnk['display_text'][:40]}  →  实际: {lnk['actual_url'][:70]}")
+            for reason in lnk['reasons']:
+                print(f"       {Y}· {reason}{RS}")
+    else:
+        ok('未发现可疑链接')
+
+    # ══════════════════════════════════════════════
+    # [8] 附件分析
+    # ══════════════════════════════════════════════
+    section(8, f'附件分析  风险: {clr(att_r["risk_level"].upper(), att_r["risk_level"])}  得分贡献: {min(att_r["risk_score"]/10,1)*10:.1f}/10')
+
+    if not email_data['attachments']:
+        print('  无附件')
+    else:
+        for i, att in enumerate(email_data['attachments'], 1):
+            fname = att.get('filename', '未知')
+            size  = att.get('size', 0)
+            ext   = att.get('extension', '')
+            is_exec = att.get('is_executable', False)
+            print(f"  {i}. {W}{fname}{RS}  ({size} 字节  {ext})")
+            if att.get('hash_md5'):
+                print(f"     MD5: {att['hash_md5']}")
+            if is_exec:
+                warn(f"可执行文件！请勿打开: {fname}", 'high')
+            if att.get('is_archive') and att.get('archive_contents'):
+                print(f"     压缩包内容: {', '.join(att['archive_contents'][:5])}")
+
+        # 附件高危汇总
+        for item in att_r.get('suspicious', []):
+            for issue in item['issues']:
+                warn(issue, 'high')
+
+    # ══════════════════════════════════════════════
+    # [9] 正文预览
+    # ══════════════════════════════════════════════
+    section(9, '正文预览')
+
     if email_data['body_text']:
-        print("\n纯文本内容:")
-        print("-" * 50)
-        print(email_data['body_text'][:500] + "..." if len(email_data['body_text']) > 500 else email_data['body_text'])
-        print("-" * 50)
-        print(f"纯文本总长度: {len(email_data['body_text'])} 字符")
-    
-    if email_data['body_html']:
-        print("\nHTML内容:")
-        print("-" * 50)
+        snippet = email_data['body_text'][:400]
+        print(f"  {snippet}{'...' if len(email_data['body_text'])>400 else ''}")
+        print(f"  {C}（纯文本共 {len(email_data['body_text'])} 字符）{RS}")
+    elif email_data['body_html']:
         try:
-            html_content = email_data['body_html']
-            
-            # 使用 BeautifulSoup 解析 HTML
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # 移除所有脚本和样式标签
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # 获取纯文本内容
-            clean_text = soup.get_text(separator='\n', strip=True)
-            
-            # 如果清理后的文本为空或看起来是乱码，尝试显示原始HTML
-            if not clean_text.strip() or all(ord(c) > 127 for c in clean_text[:20]):
-                print("警告: 尝试显示原始HTML内容:")
-                print(html_content[:1000] + "..." if len(html_content) > 1000 else html_content)
-            else:
-                print(clean_text[:1000] + "..." if len(clean_text) > 1000 else clean_text)
-            
-        except Exception as e:
-            print(f"处理HTML内容时出错: {str(e)}")
-            print("原始HTML内容:")
-            print(html_content[:200] + "..." if len(html_content) > 200 else html_content)
-        print("-" * 50)
-        print(f"HTML总长度: {len(email_data['body_html'])} 字符")
-    
-    if not email_data['body_text'] and not email_data['body_html']:
-        print("未找到邮件正文")
-    
-    # 在隐藏内容检测之前添加认证信息显示
-    print("\n[9] 邮件认证信息:")
-    auth_results = verify_email_auth(email_data)
-    
-    print(f"风险等级: {auth_results['risk_level'].upper()}")
-    if auth_results['risk_score'] > 0:
-        print(f"风险分数: {auth_results['risk_score']:.1f}")
-    
-    print("\nSPF验证:")
-    print(f"状态: {auth_results['spf']['status']}")
-    if auth_results['spf']['domain']:
-        print(f"域名: {auth_results['spf']['domain']}")
-    if auth_results['spf']['ip']:
-        print(f"发送IP: {auth_results['spf']['ip']}")
-    
-    print("\nDKIM验证:")
-    print(f"状态: {auth_results['dkim']['status']}")
-    if auth_results['dkim']['domain']:
-        print(f"域名: {auth_results['dkim']['domain']}")
-    if auth_results['dkim']['selector']:
-        print(f"选择器: {auth_results['dkim']['selector']}")
-    
-    print("\nDMARC验证:")
-    print(f"状态: {auth_results['dmarc']['status']}")
-    if auth_results['dmarc']['domain']:
-        print(f"域名: {auth_results['dmarc']['domain']}")
-    if auth_results['dmarc']['policy']:
-        print(f"策略: {auth_results['dmarc']['policy']}")
-    
-    if auth_results['warnings']:
-        print("\n警告信息:")
-        for warning in auth_results['warnings']:
-            print(f"- {warning}")
-    
-    # 在邮件认证信息后添加域名相似度检查
-    print("\n[9.1] 域名相似度检查:")
-    domain_check = check_similar_domains(email_data)
-    
-    if domain_check['similar_domains']:
-        print(f"\n风险等级: {domain_check['risk_level'].upper()}")
-        print(f"风险分数: {domain_check['risk_score']:.1f}")
-        
-        print("\n发现相似域名:")
-        for item in domain_check['similar_domains']:
-            print(f"- 发件人域名: {item['domain1']}")
-            print(f"  相似域名: {item['domain2']}")
-            print(f"  类型: {item['type']}")
-            print(f"  相似度: {item['similarity']:.2f}")
-        
-        if domain_check['warnings']:
-            print("\n警告信息:")
-            for warning in domain_check['warnings']:
-                print(f"- {warning}")
+            soup = BeautifulSoup(email_data['body_html'], 'html.parser')
+            for tag in soup(['script', 'style']):
+                tag.decompose()
+            clean = soup.get_text(separator='\n', strip=True)
+            snippet = clean[:400]
+            print(f"  {snippet}{'...' if len(clean)>400 else ''}")
+            print(f"  {C}（HTML转文本共 {len(clean)} 字符）{RS}")
+        except Exception:
+            print('  （HTML正文解析失败）')
     else:
-        print("未发现可疑的相似域名")
-    
-    # 将原来的隐藏内容检测改为[10]，URL信息改为[11]，附件信息改为[12]
-    print("\n[10] 隐藏内容检测:")
-    findings = detect_hidden_content(email_data)
-    
-    print(f"\n风险等级: {findings['risk_level'].upper()}")
-    if 'risk_score' in findings:
-        print(f"风险分数: {findings['risk_score']:.1f}")
-    
-    if 'warnings' in findings and findings['warnings']:
-        print("\n警告信息:")
-        for warning in findings['warnings']:
-            print(f"- {warning}")
-    
-    if findings['risk_level'] != 'low':
-        if findings['hidden_content']:
-            print("\n发现隐藏内容:")
-            for item in findings['hidden_content']:
-                print(f"- 类型: {item['type']}")
-                print(f"  原因: {item['reason']}")
-                if item['content']:
-                    print(f"  内容: {item['content'][:100]}...")
-        
-        if findings['tracking_elements']:
-            print("\n发现跟踪元素:")
-            for item in findings['tracking_elements']:
-                print(f"- 类型: {item['type']}")
-                print(f"  URL: {item['url']}")
-                print(f"  原因: {item['reason']}")
-        
-        if findings['suspicious_urls']:
-            print("\n发现可疑URL:")
-            for item in findings['suspicious_urls']:
-                print(f"- 类型: {item['type']}")
-                print(f"  URL: {item['url']}")
-                if item.get('text'):
-                    print(f"  显示文本: {item['text']}")
-                print(f"  原因: {item['reason']}")
+        print('  未找到邮件正文')
+
+    # ══════════════════════════════════════════════
+    # 底部综合结论
+    # ══════════════════════════════════════════════
+    print(f"\n{B}{'═'*60}{RS}")
+    print(f"{W}  综合评分: {score_color}{total_score:.1f}/100{RS}  {W}风险等级: {clr(overall_level.upper(), overall_level)}{RS}")
+
+    # 各维度得分小结
+    dim_names = {
+        'auth':'认证', 'domain':'域名仿冒', 'spoof':'发件伪造',
+        'reg':'域名年龄', 'hidden':'隐藏内容', 'url':'URL',
+        'att':'附件', 'subj':'主题', 'homo':'同形字', 'time':'时间'
+    }
+    print(f"\n  {'维度':<10} {'原始分':>6}  {'贡献分':>6}")
+    print(f"  {'─'*28}")
+    for key, (score, max_raw, weight) in WEIGHTS.items():
+        contrib = min(score / max_raw, 1.0) * weight if max_raw > 0 else 0
+        bar_c = R if contrib / weight >= 0.6 else (Y if contrib / weight >= 0.3 else G)
+        print(f"  {dim_names[key]:<10} {score:>6.1f}  {bar_c}{contrib:>5.1f}{RS}/{weight}")
+
+    if is_malicious:
+        print(f"\n{R}{'█'*60}{RS}")
+        print(f"{R}  ‼  结论：高度疑似恶意邮件，建议隔离并上报安全团队  ‼{RS}")
+        print(f"{R}{'█'*60}{RS}")
+    elif overall_level == 'medium':
+        print(f"\n{Y}  ⚠  结论：存在可疑特征，请谨慎处理，勿轻易点击链接或附件{RS}")
     else:
-        print("未发现明显的隐藏内容或跟踪器")
-    
-    # 将原来的URL信息部分改为[11]，附件信息改为[12]
-    print("\n[11] URL信息:")
-    url_analysis = extract_urls(email_data)
-    
-    if url_analysis['risk_level'] != 'low':
-        print(f"\n风险等级: {url_analysis['risk_level'].upper()}")
-        print(f"风险分数: {url_analysis['risk_score']:.1f}")
-        
-        if url_analysis['warnings']:
-            print("\n警告信息:")
-            for warning in url_analysis['warnings']:
-                print(f"- {warning}")
-        
-        if url_analysis['suspicious_links']:
-            print("\n可疑超链接:")
-            for link in url_analysis['suspicious_links']:
-                print(f"\n- 显示文本: {link['display_text']}")
-                print(f"  实际URL: {link['actual_url']}")
-                print(f"  风险等级: {link['risk_level']}")
-                print(f"  风险分数: {link['risk_score']:.1f}")
-                print("  原因:")
-                for reason in link['reasons']:
-                    print(f"    * {reason}")
-    
-    if any(url_analysis['urls'].values()):
-        # 显示纯文本中的URL
-        if url_analysis['urls']['text']:
-            print("\n纯文本中的URL:")
-            for i, url in enumerate(url_analysis['urls']['text'], 1):
-                print(f"  {i}. {url}")
-        
-        # 显示HTML中的URL
-        if url_analysis['urls']['html']:
-            print("\nHTML中的URL:")
-            for i, url in enumerate(url_analysis['urls']['html'], 1):
-                print(f"  {i}. {url}")
-        
-        # 显示附件中的URL
-        if url_analysis['urls']['attachments']:
-            print("\n附件中的URL:")
-            for i, url in enumerate(url_analysis['urls']['attachments'], 1):
-                print(f"  {i}. {url}")
-        
-        # 显示URL统计信息
-        total_urls = len(url_analysis['urls']['text']) + len(url_analysis['urls']['html']) + len(url_analysis['urls']['attachments'])
-        print(f"\n总计发现 {total_urls} 个URL:")
-        print(f"- 纯文本中: {len(url_analysis['urls']['text'])} 个")
-        print(f"- HTML中: {len(url_analysis['urls']['html'])} 个")
-        print(f"- 附件中: {len(url_analysis['urls']['attachments'])} 个")
-    else:
-        print("未发现URL")
-    
-    print("\n[12] 附件信息:")
-    if email_data['attachments']:
-        for i, attachment in enumerate(email_data['attachments'], 1):
-            print(f"\n附件 {i}:")
-            print(f"文件名: {attachment['filename']}")
-            print(f"MIME类型: {attachment['mime_type']}")
-            print(f"大小: {attachment['size']} 字节")
-            
-            # 显示额外的附件信息
-            if attachment.get('is_inline'):
-                print("类型: 内联附件")
-                if attachment.get('content_id'):
-                    print(f"Content-ID: {attachment['content_id']}")
-            
-            if attachment.get('extension'):
-                print(f"文件扩展名: {attachment['extension']}")
-            
-            if attachment.get('hash_md5'):
-                print(f"MD5: {attachment['hash_md5']}")
-                print(f"SHA256: {attachment['hash_sha256']}")
-            
-            if attachment.get('is_executable'):
-                print("警告: 这是一个可执行文件")
-            
-            if attachment.get('is_archive'):
-                print("类型: 压缩文件")
-                if attachment.get('archive_contents'):
-                    print("压缩包内容:")
-                    for item in attachment['archive_contents'][:5]:  # 只显示前5个文件
-                        print(f"  - {item}")
-                    if len(attachment['archive_contents']) > 5:
-                        print(f"  ... 等共 {len(attachment['archive_contents'])} 个文件")
-            
-            # 改进文本预览显示
-            if attachment.get('text_preview'):
-                print("\n文档内容预览:")
-                print("=" * 50)
-                preview_lines = attachment['text_preview'].split('\n')
-                # 只显示前20行
-                for line in preview_lines[:20]:
-                    print(line)
-                if len(preview_lines) > 20:
-                    print("\n... (更多内容已省略)")
-                print("=" * 50)
-    else:
-        print("无附件")
-    
-    # 在 display_report 函数中添加以下内容（在[9]邮件认证信息部分之后）
-    print("\n[9.2] 发件人真实性检测:")
-    spoofing_check = detect_spoofed_sender(email_data)
+        print(f"\n{G}  ✔  结论：未发现明显恶意特征，但仍需保持警惕{RS}")
 
-    if spoofing_check['is_spoofed']:
-        print(f"\n风险等级: {spoofing_check['risk_level'].upper()}")
-        print(f"风险分数: {spoofing_check['risk_score']:.1f}")
-        
-        print("\n警告信息:")
-        for warning in spoofing_check['warnings']:
-            print(f"- {warning}")
-    else:
-        print("未发现明显的发件人伪造迹象")
-    
-    # 在 display_report 函数中添加以下内容（在[9.2]发件人真实性检测之后）
-    print("\n[9.3] 域名注册信息分析:")
-    registration_analysis = analyze_domain_registration(email_data)
+    print(f"{B}{'═'*60}{RS}\n")
 
-    print(f"\n风险等级: {registration_analysis['risk_level'].upper()}")
-    print(f"风险分数: {registration_analysis['risk_score']:.1f}")
-
-    if registration_analysis['sender_domain']:
-        print("\n发件人域名信息:")
-        sender_info = registration_analysis['sender_domain']
-        print(f"域名: {sender_info['domain']}")
-        if sender_info['creation_date']:
-            print(f"注册时间: {sender_info['creation_date']}")
-            print(f"域名年龄: {sender_info['age_days']} 天")
-        if sender_info['expiration_date']:
-            print(f"过期时间: {sender_info['expiration_date']}")
-        print(f"风险等级: {sender_info['risk_level'].upper()}")
-
-    if registration_analysis['recipient_domain']:
-        print("\n收件人域名信息:")
-        recipient_info = registration_analysis['recipient_domain']
-        print(f"域名: {recipient_info['domain']}")
-        if recipient_info['creation_date']:
-            print(f"注册时间: {recipient_info['creation_date']}")
-            print(f"域名年龄: {recipient_info['age_days']} 天")
-        if recipient_info['expiration_date']:
-            print(f"过期时间: {recipient_info['expiration_date']}")
-        print(f"风险等级: {recipient_info['risk_level'].upper()}")
-
-    if registration_analysis['domain_age_comparison']:
-        print("\n域名年龄对比:")
-        age_diff = registration_analysis['domain_age_comparison']['age_difference_days']
-        if age_diff is not None:
-            print(f"年龄差异: {abs(age_diff)} 天")
-
-    if registration_analysis['warnings']:
-        print("\n警告信息:")
-        for warning in registration_analysis['warnings']:
-            print(f"- {warning}")
-    
-    print("\n=== 报告结束 ===")
 
 def check_similar_domains(email_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -1501,126 +1710,33 @@ def check_similar_domains(email_data: Dict[str, Any]) -> Dict[str, Any]:
     }
     
     try:
-        def extract_domain(email: str) -> str:
-            """从邮箱地址中提取域名"""
-            try:
-                # 处理带括号的邮箱地址，如 "Name (email@domain.com)"
-                email_match = re.search(r'[\w\.-]+@([\w\.-]+)', email)
-                if email_match:
-                    return email_match.group(1).lower()
-                return ''
-            except:
-                return ''
-        
-        def analyze_domain_relationship(domain1: str, domain2: str) -> Dict[str, Any]:
-            """分析两个域名之间的关系"""
-            base1 = domain1.split('.')[0]
-            base2 = domain2.split('.')[0]
-            
-            result = {
-                'similarity': 0.0,
-                'relationship_type': None,
-                'risk': 'low'
-            }
-            
-            # 1. 检查字符替换（如 sinopec -> siuopec）
-            def check_character_substitution(s1: str, s2: str) -> bool:
-                if abs(len(s1) - len(s2)) > 1:
-                    return False
-                diff_count = 0
-                for c1, c2 in zip(s1, s2):
-                    if c1 != c2:
-                        diff_count += 1
-                        if diff_count > 1:
-                            return False
-                return True
-            
-            if check_character_substitution(base1, base2):
-                result['similarity'] = 0.95
-                result['relationship_type'] = '可疑的字符替换'
-                result['risk'] = 'high'
-                return result
-            
-            # 2. 检查包含关系
-            if base1 in base2 or base2 in base1:
-                longer = base1 if len(base1) > len(base2) else base2
-                shorter = base2 if len(base1) > len(base2) else base1
-                
-                # 如果较长的域名包含较短的域名，且额外字符看起来像是正常词
-                if shorter in longer:
-                    suspicious_additions = ['portal', 'service', 'vendor', 'secure', 'mail', 
-                                         'auth', 'login', 'account', 'verify', 'update']
-                    remaining = longer.replace(shorter, '').lower()
-                    
-                    if any(word in remaining for word in suspicious_additions):
-                        result['similarity'] = 0.9
-                        result['relationship_type'] = '可疑的域名包含'
-                        result['risk'] = 'high'
-                        return result
-            
-            # 3. 检查字母顺序调换
-            if sorted(base1) == sorted(base2) and base1 != base2:
-                result['similarity'] = 1.0
-                result['relationship_type'] = '字母顺序调换'
-                result['risk'] = 'high'
-                return result
-            
-            # 4. 计算编辑距离相似度
-            def levenshtein_distance(s1: str, s2: str) -> int:
-                if len(s1) < len(s2):
-                    return levenshtein_distance(s2, s1)
-                if len(s2) == 0:
-                    return len(s1)
-                previous_row = range(len(s2) + 1)
-                for i, c1 in enumerate(s1):
-                    current_row = [i + 1]
-                    for j, c2 in enumerate(s2):
-                        insertions = previous_row[j + 1] + 1
-                        deletions = current_row[j] + 1
-                        substitutions = previous_row[j] + (c1 != c2)
-                        current_row.append(min(insertions, deletions, substitutions))
-                    previous_row = current_row
-                return previous_row[-1]
-            
-            distance = levenshtein_distance(base1, base2)
-            max_length = max(len(base1), len(base2))
-            similarity = 1 - (distance / max_length)
-            
-            if similarity > 0.8:
-                result['similarity'] = similarity
-                result['relationship_type'] = '高度相似'
-                result['risk'] = 'high'
-            
-            return result
-        
         # 收集所有域名
         domains = {
             'from': set(),
             'to': set(),
             'original_from': set()
         }
-        
-        # 提取所有域名
+
         for sender in email_data['from']:
-            domain = extract_domain(sender)
-            if domain:
-                domains['from'].add(domain)
-        
+            d = extract_email_domain(sender)
+            if d:
+                domains['from'].add(d)
+
         for recipient in email_data['to']:
-            domain = extract_domain(recipient)
-            if domain:
-                domains['to'].add(domain)
-        
+            d = extract_email_domain(recipient)
+            if d:
+                domains['to'].add(d)
+
         if email_data['thread_info']['original_sender']:
-            domain = extract_domain(email_data['thread_info']['original_sender'])
-            if domain:
-                domains['original_from'].add(domain)
-        
+            d = extract_email_domain(email_data['thread_info']['original_sender'])
+            if d:
+                domains['original_from'].add(d)
+
         # 比较所有域名组合
         # 1. 发件人域名与收件人域名比较
         for from_domain in domains['from']:
             for to_domain in domains['to']:
-                analysis = analyze_domain_relationship(from_domain, to_domain)
+                analysis = analyze_domain_similarity(from_domain, to_domain)
                 if analysis['risk'] == 'high':
                     result['similar_domains'].append({
                         'domain1': from_domain,
@@ -1630,16 +1746,15 @@ def check_similar_domains(email_data: Dict[str, Any]) -> Dict[str, Any]:
                         'similarity': analysis['similarity']
                     })
                     result['risk_score'] += 3.0
-                    
                     warning = f"发现可疑域名组合: {from_domain} <-> {to_domain} ({analysis['relationship_type']})"
                     if analysis['relationship_type'] == '可疑的域名包含':
                         warning += "\n这是典型的钓鱼邮件手法，使用目标公司域名构造相似域名"
                     result['warnings'].append(warning)
-        
+
         # 2. 发件人域名与原始发件人域名比较
         for from_domain in domains['from']:
             for orig_domain in domains['original_from']:
-                analysis = analyze_domain_relationship(from_domain, orig_domain)
+                analysis = analyze_domain_similarity(from_domain, orig_domain)
                 if analysis['risk'] == 'high':
                     result['similar_domains'].append({
                         'domain1': from_domain,
@@ -1693,44 +1808,54 @@ def detect_spoofed_sender(email_data: Dict[str, Any]) -> Dict[str, Any]:
             result['evidence'].append('SPF验证失败')
             result['risk_score'] += 3.0
         
-        # 2. 分析Received链
+        # 2. 分析 Received 链
         received_chain = []
-        if 'headers' in email_data:
-            for header, value in email_data['headers'].items():
-                if header.lower() == 'received':
-                    received_chain.append(value)
-            
-            # 检查最后一个Received头（最初的发送服务器）
-            if received_chain:
-                last_received = received_chain[-1]
-                # 检查是否来自声称的域名
-                claimed_domain = ''
-                for sender in email_data['from']:
-                    domain_match = re.search(r'@([\w.-]+)', sender)
-                    if domain_match:
-                        claimed_domain = domain_match.group(1).lower()
-                        break
-                
-                if claimed_domain and claimed_domain not in last_received.lower():
-                    result['is_spoofed'] = True
-                    result['evidence'].append(f'发件人声称来自 {claimed_domain}，但实际发送服务器不匹配')
-                    result['risk_score'] += 2.5
-        
-        # 3. 检查X-Fangmail-Spf头
-        if 'headers' in email_data and 'x-fangmail-spf' in email_data['headers']:
-            if email_data['headers']['x-fangmail-spf'].lower() == 'fail':
+        headers = email_data.get('headers', {})
+        received_val = headers.get('received', [])
+        if isinstance(received_val, list):
+            received_chain = received_val
+        elif isinstance(received_val, str):
+            received_chain = [received_val]
+
+        if received_chain:
+            last_received = received_chain[-1]
+            claimed_domain = ''
+            for sender in email_data['from']:
+                domain_match = re.search(r'@([\w.-]+)', sender)
+                if domain_match:
+                    claimed_domain = domain_match.group(1).lower()
+                    break
+
+            if claimed_domain and claimed_domain not in last_received.lower():
                 result['is_spoofed'] = True
-                result['evidence'].append('防垃圾邮件系统SPF检查失败')
-                result['risk_score'] += 2.0
+                result['evidence'].append(
+                    f'发件人声称来自 {claimed_domain}，但实际发送服务器不匹配'
+                )
+                result['risk_score'] += 2.5
+
+        # 3. 检查 X-Fangmail-Spf 头
+        if headers.get('x-fangmail-spf', '').lower() == 'fail':
+            result['is_spoofed'] = True
+            result['evidence'].append('防垃圾邮件系统SPF检查失败')
+            result['risk_score'] += 2.0
         
-        # 4. 记录可疑的发件人信息
+        # 4. 检查 Reply-To 与 From 域名是否一致（Reply-To 劫持）
+        if email_data['from'] and email_data['reply_to']:
+            from_domain_match = re.search(r'@([\w.-]+)', email_data['from'][0])
+            reply_domain_match = re.search(r'@([\w.-]+)', email_data['reply_to'][0])
+            if from_domain_match and reply_domain_match:
+                from_d = from_domain_match.group(1).lower()
+                reply_d = reply_domain_match.group(1).lower()
+                if from_d != reply_d:
+                    result['is_spoofed'] = True
+                    result['evidence'].append(
+                        f'Reply-To域名({reply_d})与From域名({from_d})不一致，存在回复劫持风险'
+                    )
+                    result['risk_score'] += 2.5
+
+        # 记录发件人
         if email_data['from']:
             result['spoofed_sender'] = email_data['from'][0]
-            # 在这个例子中，发件人伪装成 "滴滴出行合作 <bd@didiglobal.com>"
-            if 'didiglobal.com' in result['spoofed_sender'].lower():
-                result['is_spoofed'] = True
-                result['evidence'].append('发件人伪装成滴滴出行官方邮箱')
-                result['risk_score'] += 3.0
         
         # 设置风险等级
         if result['risk_score'] >= 5.0:
